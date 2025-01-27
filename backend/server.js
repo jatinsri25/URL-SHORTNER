@@ -1,142 +1,201 @@
-// backend/server.js
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
+const QRCode = require('qrcode');
+const validUrl = require('valid-url');
+require('dotenv').config();
 
 const app = express();
 
 // Middleware
 app.use(cors({
-    origin: 'http://localhost:3000',
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
     credentials: true
 }));
 app.use(express.json());
 
 // MongoDB Connection
-mongoose.connect('mongodb://127.0.0.1:27017/url-shortener')
-    .then(() => {
-        console.log('Successfully connected to MongoDB.');
-    })
-    .catch((error) => {
-        console.error('Error connecting to MongoDB:', error);
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/url-shortener')
+    .then(() => console.log('Connected to MongoDB'))
+    .catch(err => {
+        console.error('MongoDB connection error:', err);
         process.exit(1);
     });
 
 // URL Schema
 const urlSchema = new mongoose.Schema({
-    originalUrl: { type: String, required: true },
-    shortCode: { type: String, required: true, unique: true },
+    originalUrl: {
+        type: String,
+        required: true,
+        validate: {
+            validator: (v) => validUrl.isWebUri(v),
+            message: 'Invalid URL format'
+        }
+    },
+    shortCode: {
+        type: String,
+        required: true,
+        unique: true,
+        match: [/^[\w-]{3,20}$/, 'Short code must be 3-20 characters (letters, numbers, underscores, hyphens)']
+    },
     createdAt: { type: Date, default: Date.now },
     clicks: { type: Number, default: 0 },
-    lastClickedAt: Date
+    lastClickedAt: Date,
+    meta: {
+        ipAddress: String,
+        userAgent: String
+    }
 });
 
 const Url = mongoose.model('Url', urlSchema);
 
-// Generate short code
-const generateShortCode = () => {
-    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    let code = '';
-    for (let i = 0; i < 4; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return code;
+// Helper Functions
+const generateShortCode = (length = 6) => {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_';
+    return Array.from({ length }, () =>
+        chars.charAt(Math.floor(Math.random() * chars.length))).join('');
 };
 
-// API Routes
-// 1. Shorten URL
+// API Endpoints
+
+// Shorten URL
 app.post('/api/shorten', async (req, res) => {
     try {
-        const { url } = req.body;
-        if (!url) {
-            return res.status(400).json({ error: 'URL is required' });
+        const { url, customAlias } = req.body;
+
+        if (!url) return res.status(400).json({ error: 'URL is required' });
+        if (!validUrl.isWebUri(url)) return res.status(400).json({ error: 'Invalid URL format' });
+
+        let shortCode;
+        if (customAlias) {
+            if (!/^[\w-]{3,20}$/.test(customAlias)) {
+                return res.status(400).json({
+                    error: 'Custom alias must be 3-20 characters (letters, numbers, underscores, hyphens)'
+                });
+            }
+            shortCode = customAlias;
+
+            const exists = await Url.exists({ shortCode });
+            if (exists) return res.status(409).json({ error: 'Custom alias already in use' });
+        } else {
+            let isUnique = false;
+            while (!isUnique) {
+                shortCode = generateShortCode();
+                const exists = await Url.exists({ shortCode });
+                isUnique = !exists;
+            }
         }
 
-        const shortCode = generateShortCode();
         const newUrl = new Url({
             originalUrl: url,
-            shortCode
+            shortCode,
+            meta: {
+                ipAddress: req.ip,
+                userAgent: req.get('User-Agent')
+            }
         });
 
         await newUrl.save();
-        console.log('URL shortened successfully:', shortCode);
-        res.json({ shortCode });
+        res.json({
+            shortCode,
+            shortUrl: `${process.env.BASE_URL || 'http://localhost:5001'}/${shortCode}`,
+            originalUrl: url
+        });
+
     } catch (error) {
-        console.error('Error in /api/shorten:', error);
-        res.status(500).json({ error: 'Server error: ' + error.message });
+        console.error('Shorten URL error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// 2. Get URL History
+// Get URL History
 app.get('/api/history', async (req, res) => {
     try {
         const urls = await Url.find()
             .sort({ createdAt: -1 })
             .limit(10)
-            .select('shortCode originalUrl createdAt clicks');
-        res.json(urls);
+            .lean();
+
+        res.json(urls.map(url => ({
+            shortCode: url.shortCode,
+            originalUrl: url.originalUrl,
+            clicks: url.clicks,
+            createdAt: url.createdAt,
+            shortUrl: `${process.env.BASE_URL || 'http://localhost:5001'}/${url.shortCode}`
+        })));
     } catch (error) {
-        console.error('Error fetching history:', error);
+        console.error('History error:', error);
         res.status(500).json({ error: 'Failed to fetch history' });
     }
 });
 
-// 3. Get URL Stats
+// Get URL Stats
 app.get('/api/stats/:code', async (req, res) => {
     try {
         const url = await Url.findOne({ shortCode: req.params.code });
-        if (!url) {
-            return res.status(404).json({ error: 'URL not found' });
-        }
+        if (!url) return res.status(404).json({ error: 'URL not found' });
+
         res.json({
+            shortCode: url.shortCode,
+            originalUrl: url.originalUrl,
             clicks: url.clicks,
             createdAt: url.createdAt,
-            lastClickedAt: url.lastClickedAt
+            lastClickedAt: url.lastClickedAt,
+            shortUrl: `${process.env.BASE_URL || 'http://localhost:5001'}/${url.shortCode}`,
+            qrCode: `${process.env.BASE_URL || 'http://localhost:5001'}/api/qr/${url.shortCode}`
         });
     } catch (error) {
-        console.error('Error fetching stats:', error);
+        console.error('Stats error:', error);
         res.status(500).json({ error: 'Failed to fetch stats' });
     }
 });
 
-// 4. Redirect to Original URL
+// Redirect to Original URL
 app.get('/:code', async (req, res) => {
     try {
-        const url = await Url.findOne({ shortCode: req.params.code });
-        if (!url) {
-            return res.status(404).json({ error: 'URL not found' });
-        }
+        const url = await Url.findOneAndUpdate(
+            { shortCode: req.params.code },
+            {
+                $inc: { clicks: 1 },
+                $set: { lastClickedAt: new Date() }
+            },
+            { new: true }
+        );
 
-        url.clicks++;
-        url.lastClickedAt = new Date();
-        await url.save();
+        if (!url) return res.status(404).json({ error: 'URL not found' });
         res.redirect(url.originalUrl);
     } catch (error) {
-        console.error('Error in redirect:', error);
-        res.status(500).json({ error: 'Server error' });
+        console.error('Redirect error:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
-const QRCode = require('qrcode');
 
-// Add this new endpoint for QR code generation
+// Generate QR Code
 app.get('/api/qr/:code', async (req, res) => {
     try {
         const url = await Url.findOne({ shortCode: req.params.code });
-        if (!url) {
-            return res.status(404).json({ error: 'URL not found' });
-        }
+        if (!url) return res.status(404).json({ error: 'URL not found' });
 
-        // Generate QR code
-        const qrCodeUrl = await QRCode.toDataURL(`http://localhost:5001/${url.shortCode}`);
-        res.json({ qrCode: qrCodeUrl });
+        const qrCode = await QRCode.toDataURL(
+            `${process.env.BASE_URL || 'http://localhost:5001'}/${url.shortCode}`,
+            { width: 400, margin: 2 }
+        );
+
+        res.json({ qrCode });
     } catch (error) {
-        console.error('Error generating QR code:', error);
+        console.error('QR Code error:', error);
         res.status(500).json({ error: 'Failed to generate QR code' });
     }
 });
 
-// Start server
-const PORT = 5001;
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start Server
+const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-})
+    console.log(`Server running on port ${PORT}`);
+});
